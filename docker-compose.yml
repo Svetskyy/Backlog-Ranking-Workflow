@@ -1,0 +1,21 @@
+name: backlog-ranking
+
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:2.38.7
+    container_name: backlog-ranking-n8n
+    restart: unless-stopped
+    ports:
+      - "5679:5678"
+    environment:
+      - WEBHOOK_URL=http://localhost:5679/
+      - N8N_EDITOR_BASE_URL=http://localhost:5679/
+      - GENERIC_TIMEZONE=Australia/Melbourne
+      - TZ=Australia/Melbourne
+      - N8N_RESTRICT_FILE_ACCESS_TO=/files
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./sample/backlog.csv:/files/backlog.csv:ro
+
+volumes:
+  n8n_data:

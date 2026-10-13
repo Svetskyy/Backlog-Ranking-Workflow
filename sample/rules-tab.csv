@@ -1,0 +1,26 @@
+Rule,State,Value,From,To,Notes
+Planning window,,,05/10/2026,16/10/2026,The fortnight being planned. Use a Monday and a Friday.
+Rank step 1,,Director Priority,,,
+Rank step 2,,Education in holiday window,,,
+Rank step 3,,In Progress,,,Oldest first always comes last.
+Director label,,Director Priority,,,Value of the Label column
+In progress status,,In Progress,,,
+Open status,,Backlog,,,
+Open status,,Private Backlog,,,
+Open status,,School Backlog,,,
+Open status,,In Progress,,,
+Closed status,,Completed,,,Skipped
+Education sector,,Schools,,,
+Education sector,,Universities / Tertiary Education,,,
+No-constraint text,,none,,,A note that is exactly this word counts as empty
+No-constraint text,,na,,,
+No-constraint text,,x,,,
+No-constraint text,,anytime,,,
+School holiday,VIC,Term 3,21/09/2026,02/10/2026,
+School holiday,VIC,Term 4,18/12/2026,,Blank To = open ended
+School holiday,NSW,Term 3,28/09/2026,09/10/2026,
+School holiday,NSW,Term 4,18/12/2026,,
+School holiday,QLD,Term 3,21/09/2026,02/10/2026,
+School holiday,QLD,Term 4,12/12/2026,,
+Public holiday,NSW,Labour Day,05/10/2026,05/10/2026,
+Public holiday,QLD,King's Birthday,05/10/2026,05/10/2026,

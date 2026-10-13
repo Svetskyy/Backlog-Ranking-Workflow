@@ -1,0 +1,1042 @@
+{
+  "name": "Backlog Ranking",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {
+          "includeEmptyCells": true
+        }
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        880,
+        0
+      ],
+      "id": "91470d7a-62b7-44b7-9c2f-d05925d0b07f",
+      "name": "Checks backlog.csv",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "fileSelector": "/files/backlog.csv",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        672,
+        0
+      ],
+      "id": "90c03f7a-c5c1-41ff-a1a3-4bceff074017",
+      "name": "Get and Reads backlog.csv",
+      "executeOnce": false
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Rules",
+          "mode": "name"
+        },
+        "options": {
+          "outputFormatting": {
+            "values": {
+              "general": "UNFORMATTED_VALUE",
+              "date": "SERIAL_NUMBER"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        240,
+        0
+      ],
+      "id": "ad4e1b79-94ea-4cfb-b40e-1eef92cbb116",
+      "name": "Read Rules Tab",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Filter and Flag Rows: drops closed jobs, parses dates, flags rows for a human, and marks which jobs need the LLM.\n// Mode: Run Once for All Items. Outputs one item per OPEN job.\n\nconst config = $('Validate Rules').first().json.config;\nconst norm = (v) => String(v ?? '').trim().replace(/\\s+/g, ' ').toLowerCase();\nconst HUMAN = 'Needs human decision';\n\n// Stop if the CSV has no rows (the extract node sends one blank item when Always Output Data is on)\nif ($input.all().every((i) => Object.keys(i.json).length === 0)) {\n  throw new Error('CSV has no rows. Was the export empty?');\n}\n\n// Stop if the CSV is missing columns we rely on (e.g. a column was renamed in the CRM)\nconst REQUIRED = ['Job Number', 'Organization', 'Address', 'State', 'Sector', 'Status', 'Created Date', 'Label',\n  'Repair Type Selected', 'Scheduling Timing', 'Scheduling Instructions', 'Job Instructions', 'Instructions from Inspector'];\nconst seenColumns = new Set($input.all().flatMap((i) => Object.keys(i.json)));\nconst missingColumns = REQUIRED.filter((c) => !seenColumns.has(c));\nif (missingColumns.length) {\n  throw new Error(`CSV is missing columns: ${missingColumns.join(', ')}. Was the export changed or a column renamed?`);\n}\n\nconst STATE_NAMES = {\n  'new south wales': 'NSW', 'australian capital territory': 'ACT', 'northern territory': 'NT',\n  'western australia': 'WA', 'south australia': 'SA', victoria: 'VIC', queensland: 'QLD', tasmania: 'TAS',\n  vic: 'VIC', nsw: 'NSW', qld: 'QLD', act: 'ACT', sa: 'SA', wa: 'WA', tas: 'TAS', nt: 'NT',\n};\n\n// The state written at the END of the address, or null if there isn't one.\n// Street/suburb names like \"Victoria Street\" or \"Victoria Point\" are ignored because they aren't at the end.\nfunction stateFromAddress(address) {\n  let a = norm(address);\n  if (!/(south|western) australia$/.test(a)) a = a.replace(/[\\s,]*australia$/, '');\n  a = a.replace(/[\\s,]*\\d{4}$/, '').replace(/[\\s,.]+$/, '');\n  for (const [name, code] of Object.entries(STATE_NAMES)) {\n    if (a === name || a.endsWith(' ' + name) || a.endsWith(',' + name)) return code;\n  }\n  return null;\n}\n\n// \"d/m/yyyy H:mm\" -> { sort: \"yyyy-mm-ddTHH:mm\", display: \"dd/mm/yyyy\" }, or null if it doesn't fit exactly.\nfunction parseCreated(text) {\n  const m = String(text ?? '').trim().match(/^(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})\\s+(\\d{1,2}):(\\d{2})$/);\n  if (!m) return null;\n  const [day, month, year, hour, minute] = m.slice(1).map(Number);\n  const d = new Date(Date.UTC(year, month - 1, day));\n  if (d.getUTCDate() !== day || d.getUTCMonth() !== month - 1 || hour > 23 || minute > 59) return null;\n  const p = (n) => String(n).padStart(2, '0');\n  return { sort: `${year}-${p(month)}-${p(day)}T${p(hour)}:${p(minute)}`, display: `${p(day)}/${p(month)}/${year}` };\n}\n\nconst NOTE_FIELDS = [\n  ['Scheduling Timing', 'schedulingTiming'],\n  ['Scheduling Instructions', 'schedulingInstructions'],\n  ['Job Instructions', 'jobInstructions'],\n  ['Instructions from Inspector', 'inspectorInstructions'],\n];\n\nconst rows = $input.all().map((item, i) => ({ ...item.json, _csvRow: i + 2 }));\nconst openJobs = [];\n\nfor (const r of rows) {\n  const status = norm(r['Status']);\n  if (config.closedStatuses.includes(status)) continue; // counted in the Run Log as Closed Skipped\n\n  const issues = [];\n  const jobNumber = String(r['Job Number'] ?? '').trim();\n  const state = String(r['State'] ?? '').trim().toUpperCase();\n  const sector = norm(r['Sector']);\n\n  if (!jobNumber) issues.push({ issue: 'Missing Job Number', sourceText: `CSV row ${r._csvRow}` });\n\n  if (!config.openStatuses.includes(status)) {\n    issues.push({ issue: `Unknown status \"${r['Status']}\" (not in Open or Closed status rules)`, sourceText: r['Status'] ?? '' });\n  }\n\n  const created = parseCreated(r['Created Date']);\n  if (!created) issues.push({ issue: 'Created Date is not in d/m/yyyy H:mm format', sourceText: r['Created Date'] ?? '' });\n\n  const addressState = stateFromAddress(r['Address']);\n  if (addressState && addressState !== state) {\n    issues.push({ issue: `State column says ${state} but address says ${addressState}`, sourceText: r['Address'] });\n  }\n\n  if (norm(r['Repair Type Selected']) === 'paid inspection') {\n    issues.push({ issue: 'Paid inspection, not repair work', sourceText: r['Repair Type Selected'] });\n  }\n\n  const isEducation = config.educationSectors.includes(sector);\n  if (isEducation && !config.schoolHolidays[state]) {\n    issues.push({ issue: `Education job but no School holiday rows for state \"${state}\"`, sourceText: r['State'] ?? '' });\n  }\n\n  // Keep only notes with real content. A note that is exactly a no-constraint word counts as empty.\n  const notes = {};\n  const llmLines = [];\n  for (const [column, key] of NOTE_FIELDS) {\n    const raw = String(r[column] ?? '').trim();\n    notes[key] = raw;\n    if (raw && !config.noConstraintText.includes(norm(raw))) llmLines.push(`${column}: ${raw}`);\n  }\n\n  openJobs.push({\n    jobNumber,\n    csvRow: r._csvRow,\n    organization: r['Organization'] ?? '',\n    address: r['Address'] ?? '',\n    state,\n    sector: r['Sector'] ?? '',\n    status: r['Status'] ?? '',\n    repairType: r['Repair Type Selected'] ?? '',\n    createdSort: created?.sort ?? null,\n    createdDisplay: created?.display ?? String(r['Created Date'] ?? ''),\n    isDirector: config.directorLabels.includes(norm(r['Label'])),\n    isInProgress: config.inProgressStatuses.includes(status),\n    isEducation,\n    notes,\n    llmText: llmLines.join('\\n'),\n    issues: issues.map((i) => ({ category: HUMAN, ...i })),\n  });\n}\n\n// Duplicate Job Numbers among open jobs: flag every copy so none is silently overwritten later\nconst seen = {};\nfor (const j of openJobs) if (j.jobNumber) seen[j.jobNumber] = (seen[j.jobNumber] ?? 0) + 1;\nfor (const j of openJobs) {\n  if (seen[j.jobNumber] > 1) j.issues.push({ category: HUMAN, issue: 'Duplicate Job Number', sourceText: j.jobNumber });\n}\n\n// Send to the LLM only if there is real text to read AND the job isn't already going to a human\nfor (const j of openJobs) j.needsLlm = j.llmText !== '' && j.issues.length === 0;\n\nreturn openJobs.map((j) => ({ json: j }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        0
+      ],
+      "id": "347186f4-74ff-4d7a-9415-d25366923d83",
+      "name": "Filter and Flag Rows"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate Rules: reads every Rules-tab row and turns them into ONE config item.\n// If any rule is broken, it throws an error so the run stops before anything else happens.\n\nconst norm = (v) => String(v ?? '').trim().replace(/\\s+/g, ' ').toLowerCase();\n\nconst RANK_STEP_NAMES = ['director priority', 'education in holiday window', 'in progress'];\nconst LIST_RULES = {\n  'director label': 'directorLabels',\n  'in progress status': 'inProgressStatuses',\n  'open status': 'openStatuses',\n  'closed status': 'closedStatuses',\n  'education sector': 'educationSectors',\n  'no-constraint text': 'noConstraintText',\n};\nconst DATE_RULES = ['planning window', 'school holiday', 'public holiday'];\n\n// Sheets date (serial number, or \"d/m/yyyy\" text) -> \"yyyy-mm-dd\". Returns null if blank or invalid.\nfunction toIsoDate(v) {\n  const s = String(v ?? '').trim();\n  if (s === '') return null;\n  if (/^\\d+(\\.\\d+)?$/.test(s)) {\n    const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(Number(s)) * 86400000);\n    return d.toISOString().slice(0, 10);\n  }\n  const m = s.match(/^(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})$/);\n  if (!m) return null;\n  const day = Number(m[1]), month = Number(m[2]), year = Number(m[3]);\n  const d = new Date(Date.UTC(year, month - 1, day));\n  if (d.getUTCDate() !== day || d.getUTCMonth() !== month - 1) return null; // e.g. 31/02\n  return d.toISOString().slice(0, 10);\n}\n\nconst rows = $input.all().map((item, i) => ({ ...item.json, _row: item.json.row_number ?? i + 2 }));\n\nif (!rows.some((r) => 'Rule' in r)) {\n  throw new Error('Rules tab is empty, or row 1 is not the header: Rule | State | Value | From | To | Notes');\n}\n\nconst config = {\n  planningWindow: null,\n  rankSteps: [],\n  directorLabels: [], inProgressStatuses: [], openStatuses: [], closedStatuses: [],\n  educationSectors: [], noConstraintText: [],\n  schoolHolidays: {},  // { VIC: [{ term, from, to }], ... }\n  publicHolidays: {},  // { NSW: [{ name, from, to }], ... }\n};\nconst planningWindows = [];\nconst rankSteps = [];\nconst errors = [];\n\nfor (const r of rows) {\n  const rule = norm(r.Rule);\n  const value = norm(r.Value);\n  const state = String(r.State ?? '').trim().toUpperCase();\n  const fromText = String(r.From ?? '').trim();\n  const toText = String(r.To ?? '').trim();\n  const where = `Row ${r._row}`;\n\n  // Skip completely blank rows\n  if (!rule && !value && !state && !fromText && !toText) continue;\n\n  // Check 1: unknown rule name\n  const stepMatch = rule.match(/^rank step (\\d+)$/);\n  if (!LIST_RULES[rule] && !DATE_RULES.includes(rule) && !stepMatch) {\n    errors.push(`${where}: unknown rule name \"${r.Rule}\"`);\n    continue;\n  }\n\n  if (stepMatch) {\n    if (RANK_STEP_NAMES.includes(value)) rankSteps.push({ order: Number(stepMatch[1]), name: value });\n    else errors.push(`${where}: unknown rank step \"${r.Value}\" (use Director Priority, Education in holiday window, or In Progress)`);\n    continue;\n  }\n\n  if (LIST_RULES[rule]) {\n    if (value) config[LIST_RULES[rule]].push(value);\n    continue;\n  }\n\n  // Check 2: missing date, or To before From\n  const from = toIsoDate(r.From);\n  const to = toIsoDate(r.To);\n  const blankToAllowed = rule === 'school holiday' && toText === '';\n  if (!from) { errors.push(`${where} (${r.Rule}): From date missing or not a valid date`); continue; }\n  if (!to && !blankToAllowed) { errors.push(`${where} (${r.Rule}): To date missing or not a valid date`); continue; }\n  if (to && to < from) { errors.push(`${where} (${r.Rule}): To ${to} is before From ${from}`); continue; }\n\n  if (rule === 'planning window') planningWindows.push({ from, to });\n  else if (rule === 'school holiday') (config.schoolHolidays[state] ??= []).push({ term: r.Value ?? '', from, to });\n  else (config.publicHolidays[state] ??= []).push({ name: r.Value ?? '', from, to });\n}\n\n// Check 3: exactly one planning window\nif (planningWindows.length === 0) errors.push('No \"Planning window\" row found');\nif (planningWindows.length > 1) errors.push(`${planningWindows.length} \"Planning window\" rows found, keep only one`);\n\n// Check 4: the same status in both Open and Closed\nfor (const s of config.openStatuses) {\n  if (config.closedStatuses.includes(s)) errors.push(`Status \"${s}\" is listed as both Open and Closed`);\n}\n\nif (errors.length) {\n  throw new Error(`Rules tab has ${errors.length} problem(s):\\n- ${errors.join('\\n- ')}`);\n}\n\nconfig.planningWindow = planningWindows[0];\nconfig.rankSteps = rankSteps.sort((a, b) => a.order - b.order).map((s) => s.name);\nfor (const list of Object.values(config.schoolHolidays)) list.sort((a, b) => a.from.localeCompare(b.from));\n\nreturn [{ json: { config, rulesRowCount: rows.length, startedAt: $now.toFormat('dd/MM/yyyy HH:mm:ss') } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        464,
+        0
+      ],
+      "id": "91ca4087-50e2-4706-b85f-2c9b4b469240",
+      "name": "Validate Rules"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "648d232d-896f-4e6f-b754-1fdf7ae43d05",
+              "leftValue": "={{ $json.needsLlm }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1328,
+        0
+      ],
+      "id": "1b04f831-188f-46d2-93dd-ce6a8769bd79",
+      "name": "Needs AI?",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Job number: {{ $json.jobNumber }}\n\nNotes:\n{{ $json.llmText }}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "=You extract scheduling constraints from free-text notes on field repair jobs for an Australian services company. Other software does all date calculations and decisions. Your only job is to copy out what the notes say, in structured form.  GENERAL RULES 1. Extract only what is written. Never guess, assume or add. If nothing fits a field, use null or an empty list. 2. Do not calculate anything: do not work out years, weekdays, durations, or whether a date has passed. 3. Dates are Australian: 7/10/26 means 7 October 2026. 4. Every extracted item must be backed by a quote copied exactly from the notes: one unbroken piece of text, unchanged, no \"...\", about 3 to 15 words.  DATE_WINDOWS: periods when the work can or cannot happen - kind \"allowed\": a date, range or set of dates when work may happen, including preferred dates. Each separate date or range is its own window. \"24th Sep / 28th Sep / 6th Oct\" gives three windows. - kind \"avoid\": dates the work must not happen on. - A single date: start and end are the same date. - \"from X\", \"after X\", \"not before X\", \"can't start till X\": start is X, end is null. - \"by X\", \"before X\", \"until X\": start is null, end is X. - A whole month (\"in October\"): start is day 1, end is the last day of that month. - year: only if the year is written (\"7/10/26\" gives 2026). Otherwise null. - weekday: only if a weekday is written next to that date (\"Tuesday 6th October\" gives \"Tue\"). Otherwise null. - If the month is not written next to the day, use it only when the same note makes it unmistakable, for example \"Avoid Monday the 28th\" in a note that also says \"28th Sept - 9th October\". Otherwise put the phrase in unclear_timing. - Ignore dates that are not about when the work happens: insurance or WorkCover expiry, induction validity periods, invoicing dates.  ALLOWED_WEEKDAYS: only when the notes restrict which days of the week work can happen. \"Between Tues and Friday\" gives Tue, Wed, Thu, Fri. Saying another day is \"also OK\" is not a restriction. Otherwise null.  TIME_OF_DAY: a short phrase if the notes limit the time of day, such as \"Afternoon only\", \"Start 7:00 am\", \"Early morning preferred\". Otherwise null.  NOTICE_REQUIRED: a short phrase if the client needs advance notice, such as \"1 week notice to client\". Otherwise null.  PRECONDITIONS: things that must happen or be confirmed BEFORE the job can be booked: a purchase order, a site walk or scope confirmation before works, other works that must finish first, management approval of a plan. NOT preconditions: on-the-day tasks (meet or call the site contact, sign in, a pre-work inspection done on the day), access admin (contractor sign-in PINs, inductions, keys, parking), or \"book in with site contact\".  UNCLEAR_TIMING: timing that cannot be turned into dates without guessing, such as \"September school holidays\", \"late July / early August\", \"week of 21 October\", \"Term 4\". Quote the phrase. Otherwise null. Urgency words like \"ASAP\" or \"priority job\" are not timing. Ignore them.  SOURCE_QUOTES: the exact quotes supporting allowed_weekdays, time_of_day, notice_required, preconditions and unclear_timing.  JOB_NUMBER: copy the job number you were given.  EXAMPLE A Notes: Scheduling Timing: Client prefers Wednesday 14th October or anytime from 19/10/26. Not on Fri 16th October. Scheduling Instructions: Ensure PO is received before booking. Start no earlier than 8am. Correct extraction: - allowed window, start and end 14 October, year null, weekday Wed, quote \"Wednesday 14th October\" - allowed window, start 19 October 2026, weekday null, end null, quote \"anytime from 19/10/26\" - avoid window, start and end 16 October, year null, weekday Fri, quote \"Not on Fri 16th October\" - time_of_day \"Start no earlier than 8am\" - preconditions: \"PO must be received before booking\" - everything else null or empty  EXAMPLE B Notes: Instructions from Inspector: Large site, sign in at reception. Contractor sign-in PIN required for 2 technicians. Job Instructions: Meet site contact on arrival. Insurance expiry 30/06/2025. Correct extraction: no date windows (the insurance date is not about when the work happens), no preconditions, everything null or empty."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1584,
+        -80
+      ],
+      "id": "482df876-8847-4012-a43f-0dfdbda5c1a6",
+      "name": "AI: Read Notes",
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-sonnet-5-5",
+          "mode": "list",
+          "cachedResultName": "Claude Sonnet 5.5"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.6,
+      "position": [
+        1584,
+        144
+      ],
+      "id": "a75be413-1296-4391-935c-29b530f7d26b",
+      "name": "Anthropic Chat Model",
+      "credentials": {
+        "anthropicApi": {
+          "id": "REPLACE_ME",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"job_number\": { \"type\": \"string\" },\n    \"date_windows\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"kind\": { \"type\": \"string\", \"enum\": [\"allowed\", \"avoid\"] },\n          \"start\": { \"$ref\": \"#/definitions/date\" },\n          \"end\": { \"$ref\": \"#/definitions/date\" },\n          \"source_quote\": { \"type\": \"string\" }\n        },\n        \"required\": [\"kind\", \"start\", \"end\", \"source_quote\"]\n      }\n    },\n    \"allowed_weekdays\": {\n      \"type\": [\"array\", \"null\"],\n      \"items\": { \"type\": \"string\", \"enum\": [\"Mon\", \"Tue\", \"Wed\", \"Thu\", \"Fri\", \"Sat\", \"Sun\"] }\n    },\n    \"time_of_day\": { \"type\": [\"string\", \"null\"] },\n    \"notice_required\": { \"type\": [\"string\", \"null\"] },\n    \"preconditions\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } },\n    \"unclear_timing\": { \"type\": [\"string\", \"null\"] },\n    \"source_quotes\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } }\n  },\n  \"required\": [\"job_number\", \"date_windows\", \"allowed_weekdays\", \"time_of_day\", \"notice_required\", \"preconditions\", \"unclear_timing\", \"source_quotes\"],\n  \"definitions\": {\n    \"date\": {\n      \"type\": [\"object\", \"null\"],\n      \"properties\": {\n        \"day\": { \"type\": \"integer\", \"minimum\": 1, \"maximum\": 31 },\n        \"month\": { \"type\": \"integer\", \"minimum\": 1, \"maximum\": 12 },\n        \"year\": { \"type\": [\"integer\", \"null\"] },\n        \"weekday\": { \"type\": [\"string\", \"null\"], \"enum\": [\"Mon\", \"Tue\", \"Wed\", \"Thu\", \"Fri\", \"Sat\", \"Sun\", null] }\n      },\n      \"required\": [\"day\", \"month\", \"year\", \"weekday\"]\n    }\n  }\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        1728,
+        144
+      ],
+      "id": "aae93330-d56f-4668-949f-45896c215c55",
+      "name": "Structured Output Parser"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge LLM Results: joins each LLM extraction back to its job and checks it can be trusted.\n// Mode: Run Once for All Items. Input: the LLM node's output. Output: ALL open jobs (62), each with llmStatus.\n\nconst config = $('Validate Rules').first().json.config;\nconst jobs = $('Filter and Flag Rows').all().map((i) => ({ ...i.json, issues: [...i.json.issues] }));\nconst HUMAN = 'Needs human decision';\nconst WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\nconst defaultYear = Number(config.planningWindow.from.slice(0, 4));\nconst squash = (v) => String(v ?? '').toLowerCase().replace(/\\s+/g, ' ').trim();\n\n// 1. Collect LLM results by the job number the LLM echoed back\nconst results = {};\nfor (const item of $input.all()) {\n  const out = item.json.output;\n  if (!out || typeof out !== 'object') continue; // failed calls / empty items have no output\n  const key = String(out.job_number ?? '').trim();\n  (results[key] ??= []).push(out);\n}\n\n// LLM date -> \"yyyy-mm-dd\", or an error message\nfunction resolveDate(d, label) {\n  if (d === null || d === undefined) return { iso: null };\n  if (typeof d !== 'object') return { error: `${label} is not a date object` };\n  const day = d.day, month = d.month;\n  const year = d.year ?? defaultYear;\n  if (![day, month, year].every(Number.isInteger)) return { error: `${label} has a missing or non-whole day/month/year` };\n  const date = new Date(Date.UTC(year, month - 1, day));\n  if (date.getUTCDate() !== day || date.getUTCMonth() !== month - 1) return { error: `${label} ${day}/${month}/${year} is not a real date` };\n  if (d.weekday && d.weekday !== WEEKDAYS[date.getUTCDay()]) {\n    return { error: `${label} says ${d.weekday} but ${day}/${month}/${year} is a ${WEEKDAYS[date.getUTCDay()]}` };\n  }\n  return { iso: date.toISOString().slice(0, 10) };\n}\n\n// 2. Check one extraction. Returns { problems, extraction }\nfunction check(out, job) {\n  const problems = [];\n  const text = squash(job.llmText);\n  const quoteFound = (q) => typeof q === 'string' && q.trim() !== '' && text.includes(squash(q));\n\n  const windows = [];\n  if (!Array.isArray(out.date_windows)) problems.push('date_windows is not a list');\n  for (const [n, w] of (Array.isArray(out.date_windows) ? out.date_windows : []).entries()) {\n    const label = `window ${n + 1}`;\n    if (!['allowed', 'avoid'].includes(w?.kind)) { problems.push(`${label} has kind \"${w?.kind}\"`); continue; }\n    const start = resolveDate(w.start, `${label} start`);\n    const end = resolveDate(w.end, `${label} end`);\n    if (start.error) problems.push(start.error);\n    if (end.error) problems.push(end.error);\n    if (start.error || end.error) continue;\n    if (!start.iso && !end.iso) { problems.push(`${label} has neither start nor end`); continue; }\n    if (start.iso && end.iso && end.iso < start.iso) { problems.push(`${label} ends before it starts`); continue; }\n    if (!quoteFound(w.source_quote)) { problems.push(`${label} quote not found in notes: \"${w.source_quote}\"`); continue; }\n    windows.push({ kind: w.kind, start: start.iso, end: end.iso, quote: w.source_quote });\n  }\n\n  const weekdays = out.allowed_weekdays;\n  if (weekdays !== null && weekdays !== undefined &&\n      (!Array.isArray(weekdays) || weekdays.some((d) => !WEEKDAYS.includes(d)))) {\n    problems.push(`allowed_weekdays is not a list of Mon..Sun: ${JSON.stringify(weekdays)}`);\n  }\n  for (const f of ['time_of_day', 'notice_required', 'unclear_timing']) {\n    if (out[f] !== null && out[f] !== undefined && typeof out[f] !== 'string') problems.push(`${f} is not text`);\n  }\n  const preconditions = Array.isArray(out.preconditions) ? out.preconditions.filter((p) => String(p).trim()) : null;\n  if (!preconditions) problems.push('preconditions is not a list');\n\n  // Every quote must really be in the notes, and non-date answers need at least one quote\n  const quotes = Array.isArray(out.source_quotes) ? out.source_quotes : [];\n  for (const q of quotes) if (!quoteFound(q)) problems.push(`quote not found in notes: \"${q}\"`);\n  const hasNonDateAnswer = (weekdays?.length > 0) || out.time_of_day || out.notice_required || out.unclear_timing || preconditions?.length > 0;\n  if (hasNonDateAnswer && quotes.length === 0) problems.push('answers given without any source quote');\n\n  return {\n    problems,\n    extraction: {\n      dateWindows: windows,\n      allowedWeekdays: weekdays?.length ? weekdays : null,\n      timeOfDay: out.time_of_day || null,\n      noticeRequired: out.notice_required || null,\n      preconditions: preconditions ?? [],\n      unclearTiming: out.unclear_timing || null,\n      quotes,\n    },\n  };\n}\n\n// 3. Attach a result to every job that needed the LLM\nfor (const job of jobs) {\n  job.extraction = null;\n  if (!job.needsLlm) { job.llmStatus = 'skipped'; continue; }\n\n  const found = results[job.jobNumber] ?? [];\n  if (found.length === 0) {\n    job.llmStatus = 'failed';\n    job.issues.push({ category: HUMAN, issue: 'LLM extraction failed (no result after retries)', sourceText: job.llmText });\n    continue;\n  }\n  if (found.length > 1) {\n    job.llmStatus = 'invalid';\n    job.issues.push({ category: HUMAN, issue: `LLM output invalid: ${found.length} results claim this job number`, sourceText: job.llmText });\n    continue;\n  }\n\n  const { problems, extraction } = check(found[0], job);\n  if (problems.length) {\n    job.llmStatus = 'invalid';\n    job.issues.push({ category: HUMAN, issue: `LLM output invalid: ${problems.join('; ')}`, sourceText: job.llmText });\n  } else {\n    job.llmStatus = 'ok';\n    job.extraction = extraction;\n  }\n}\n\nreturn jobs.map((j) => ({ json: j }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1968,
+        -80
+      ],
+      "id": "fdfac5b9-4d59-4bf2-8232-b48bd1c8dca3",
+      "name": "Merge LLM Results"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Categorise & Rank: decides Ranked vs Needs Review for every job, ranks the Ranked ones, and writes the reasons.\n// Mode: Run Once for All Items. Input: 62 jobs from Merge LLM Results.\n// Output: one item per job: { tab: 'Ranked' | 'Needs Review', row: { ...sheet columns } }\n\nconst config = $('Validate Rules').first().json.config;\nconst jobs = $input.all().map((i) => i.json);\nconst runId = `${$now.toFormat('yyyy-MM-dd HH:mm')} #${$execution.id}`;\nconst HUMAN = 'Needs human decision';\nconst LATER = 'Not this fortnight';\nconst WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];\nconst STEP_LABELS = {\n  'director priority': 'Director Priority',\n  'education in holiday window': 'Education in holiday window',\n  'in progress': 'In Progress',\n};\nconst LEFTOVER = 'Oldest first';\n\n// ---------- date helpers (all dates are \"yyyy-mm-dd\" text) ----------\nconst toDate = (iso) => new Date(iso + 'T00:00:00Z');\nconst addDays = (iso, n) => new Date(toDate(iso).getTime() + n * 86400000).toISOString().slice(0, 10);\nconst weekday = (iso) => WEEKDAYS[toDate(iso).getUTCDay()];\nconst show = (iso) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}`;\nconst showShort = (iso) => `${weekday(iso)} ${iso.slice(8, 10)}/${iso.slice(5, 7)}`;\n// Is the day inside a range? A null start or end means open-ended on that side.\nconst inRange = (iso, from, to) => (!from || iso >= from) && (!to || iso <= to);\n\nconst plan = config.planningWindow;\nconst planDays = [];\nfor (let d = plan.from; d <= plan.to; d = addDays(d, 1)) {\n  if (!['Sat', 'Sun'].includes(weekday(d))) planDays.push(d); // crews work Mon-Fri\n}\n\n// Working days in the fortnight for one state (public holidays removed), plus the holidays that were removed\nfunction stateDays(state) {\n  const holidays = config.publicHolidays[state] ?? [];\n  const removed = holidays.filter((h) => planDays.some((d) => inRange(d, h.from, h.to)));\n  const days = planDays.filter((d) => !holidays.some((h) => inRange(d, h.from, h.to)));\n  return { days, removed };\n}\n\n// \"Any weekday 05/10–16/10\", or ranges like \"Tue 06/10–Fri 09/10\"\nfunction describeDays(days, allDays) {\n  if (days.length === allDays.length) return `Any weekday ${show(days[0]).slice(0, 5)}–${show(days.at(-1)).slice(0, 5)}`;\n  const groups = [];\n  for (const d of days) {\n    const last = groups.at(-1);\n    if (last && planDays.indexOf(d) === planDays.indexOf(last.at(-1)) + 1) last.push(d);\n    else groups.push([d]);\n  }\n  return groups.map((g) => (g.length === 1 ? showShort(g[0]) : `${showShort(g[0])}–${showShort(g.at(-1))}`)).join(', ');\n}\n\n// ---------- decide each job ----------\nconst ranked = [];\nconst review = [];\n\nfor (const job of jobs) {\n  const issues = [...job.issues];\n  const ex = job.extraction ?? { dateWindows: [], allowedWeekdays: null, preconditions: [], unclearTiming: null };\n  const quotes = (ex.quotes ?? []).join(' | ');\n\n  for (const p of ex.preconditions) issues.push({ category: HUMAN, issue: `Must happen before booking: ${p}`, sourceText: quotes });\n  if (ex.unclearTiming) issues.push({ category: HUMAN, issue: `Timing can't be turned into dates: \"${ex.unclearTiming}\"`, sourceText: quotes });\n\n  const { days: baseDays, removed } = stateDays(job.state);\n  const allowed = ex.dateWindows.filter((w) => w.kind === 'allowed');\n  const avoid = ex.dateWindows.filter((w) => w.kind === 'avoid');\n  const holidays = job.isEducation ? (config.schoolHolidays[job.state] ?? []) : [];\n\n  let days = baseDays;\n  if (allowed.length) days = days.filter((d) => allowed.some((w) => inRange(d, w.start, w.end)));\n  days = days.filter((d) => !avoid.some((w) => inRange(d, w.start, w.end)));\n  if (ex.allowedWeekdays) days = days.filter((d) => ex.allowedWeekdays.includes(weekday(d)));\n  if (job.isEducation) days = days.filter((d) => holidays.some((h) => inRange(d, h.from, h.to)));\n\n  // No usable day this fortnight: is there a clear later date, or does a human need to look?\n  if (days.length === 0 && !issues.some((i) => i.category === HUMAN)) {\n    const after = addDays(plan.to, 1);\n    const windowSource = allowed.map((w) => w.quote).join(' | ');\n    const futureAllowed = allowed.filter((w) => !w.end || w.end >= after);\n\n    if (allowed.length && futureAllowed.length === 0) {\n      const lastEnd = allowed.map((w) => w.end).sort().at(-1);\n      const why = lastEnd < plan.from\n        ? `Client's date window has already passed (ended ${show(lastEnd)})`\n        : `No weekday in the fortnight fits the client's dates${job.isEducation ? ` and ${job.state} school holidays` : ''} (client window ends ${show(lastEnd)})`;\n      issues.push({ category: HUMAN, issue: why, sourceText: windowSource });\n    } else if (job.isEducation) {\n      const futureHols = holidays.filter((h) => !h.to || h.to >= after);\n      // earliest day that is after the fortnight, inside a future holiday, and inside a future client window (if any)\n      let earliest = null;\n      for (const h of futureHols) {\n        const ranges = futureAllowed.length ? futureAllowed : [{ start: null, end: null }];\n        for (const w of ranges) {\n          const start = [after, h.from, w.start].filter(Boolean).sort().at(-1);\n          const end = [h.to, w.end].filter(Boolean).sort()[0] ?? null;\n          if (!end || start <= end) earliest = earliest && earliest < start ? earliest : start;\n        }\n      }\n      if (earliest) {\n        issues.push({ category: LATER, issue: `No ${job.state} school holiday days in ${show(plan.from)}–${show(plan.to)}; next possible from ${show(earliest)}`, sourceText: windowSource || `${job.state} education job` });\n      } else {\n        issues.push({ category: HUMAN, issue: `Client's dates don't overlap any upcoming ${job.state} school holiday in the Rules tab`, sourceText: windowSource });\n      }\n    } else if (futureAllowed.length) {\n      const earliest = futureAllowed.map((w) => w.start ?? after).map((s) => (s < after ? after : s)).sort()[0];\n      issues.push({ category: LATER, issue: `Client's dates are after this fortnight; earliest ${show(earliest)}`, sourceText: windowSource });\n    } else {\n      issues.push({ category: HUMAN, issue: 'No weekday in the fortnight fits the notes (avoid dates / weekday limits)', sourceText: quotes });\n    }\n  }\n\n  const base = {\n    'Job Number': job.jobNumber,\n    'Organization': job.organization,\n    'State': job.state,\n    'Sector': job.sector,\n    'Status': job.status,\n    'Created Date': job.createdDisplay,\n  };\n\n  if (issues.length) {\n    const category = issues.some((i) => i.category === HUMAN) ? HUMAN : LATER;\n    review.push({ job, row: {\n      ...base,\n      'Issue Category': category,\n      'Issue': issues.map((i) => i.issue).join('; '),\n      'Source Text': [...new Set(issues.map((i) => i.sourceText).filter(Boolean))].join(' | '),\n      'Run ID': runId,\n    } });\n    continue;\n  }\n\n  // Rank step = the first step in Rules order that this job matches\n  const matches = {\n    'director priority': job.isDirector,\n    'education in holiday window': job.isEducation,\n    'in progress': job.isInProgress,\n  };\n  const stepIndex = config.rankSteps.findIndex((s) => matches[s]);\n  const step = stepIndex === -1 ? LEFTOVER : STEP_LABELS[config.rankSteps[stepIndex]];\n\n  const bookingNotes = [\n    ex.timeOfDay,\n    ex.noticeRequired,\n    ex.allowedWeekdays ? `Only ${ex.allowedWeekdays.join(', ')}` : null,\n  ].filter(Boolean).join('; ');\n\n  ranked.push({\n    job, days, removed, step, bookingNotes,\n    group: stepIndex === -1 ? config.rankSteps.length : stepIndex,\n    allowedDates: describeDays(days, planDays),\n  });\n}\n\n// ---------- sort: rank step, then oldest Created Date, then Job Number ----------\nconst num = (s) => (/^\\d+$/.test(s) ? Number(s) : Infinity);\nranked.sort((a, b) =>\n  a.group - b.group ||\n  a.job.createdSort.localeCompare(b.job.createdSort) ||\n  num(a.job.jobNumber) - num(b.job.jobNumber) ||\n  a.job.jobNumber.localeCompare(b.job.jobNumber));\n\n// ---------- reasons ----------\nconst groupSize = {};\nfor (const r of ranked) groupSize[r.step] = (groupSize[r.step] ?? 0) + 1;\nconst seenInGroup = {};\n\nconst rankedRows = ranked.map((r, i) => {\n  const pos = (seenInGroup[r.step] = (seenInGroup[r.step] ?? 0) + 1);\n  const order = `${pos} of ${groupSize[r.step]} in this group by age (created ${r.job.createdDisplay})`;\n  const holidayNote = r.removed.length ? ` (${r.removed.map((h) => `${show(h.from).slice(0, 5)} is ${h.name}`).join(', ')})` : '';\n  let why;\n  if (r.step === 'Director Priority') why = `Director Priority label; ${order}`;\n  else if (r.step === 'Education in holiday window') why = `${r.job.state} education job inside school holidays: ${r.allowedDates}${holidayNote}; ${order}`;\n  else if (r.step === 'In Progress') why = `Work already in progress; ${order}`;\n  else why = `No higher rule applies; ${order}`;\n  if (r.job.extraction?.noticeRequired) why += `; ${r.job.extraction.noticeRequired}`;\n\n  return { tab: 'Ranked', row: {\n    'Rank': i + 1,\n    'Job Number': r.job.jobNumber,\n    'Organization': r.job.organization,\n    'State': r.job.state,\n    'Sector': r.job.sector,\n    'Status': r.job.status,\n    'Created Date': r.job.createdDisplay,\n    'Rank Step': r.step,\n    'Allowed Dates': r.allowedDates + holidayNote,\n    'Booking Notes': r.bookingNotes,\n    'Reason': why,\n    'Run ID': runId,\n  } };\n});\n\n// Needs Review: human decisions first, then oldest first\nreview.sort((a, b) =>\n  (a.row['Issue Category'] === HUMAN ? 0 : 1) - (b.row['Issue Category'] === HUMAN ? 0 : 1) ||\n  String(a.job.createdSort).localeCompare(String(b.job.createdSort)));\nconst reviewRows = review.map((r) => ({ tab: 'Needs Review', row: r.row }));\n\nreturn [...rankedRows, ...reviewRows].map((x) => ({ json: x }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2192,
+        -80
+      ],
+      "id": "0b753a62-7ef8-42ff-8f19-13c3c5980db3",
+      "name": "Categorize and Rank"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Counts Check: proves every job is accounted for BEFORE anything is written. Throws (fails the run) if not.\n// Mode: Run Once for All Items. Input: items from Categorise & Rank.\n// Output: ONE item: { summary, ranked: [rows], review: [rows] }\n\nconst CSV_NODE = 'Checks backlog.csv';\n\nconst config = $('Validate Rules').first().json.config;\nconst norm = (v) => String(v ?? '').trim().replace(/\\s+/g, ' ').toLowerCase();\n\nconst csvRows = $(CSV_NODE).all().map((i) => i.json);\nconst openJobs = $('Filter and Flag Rows').all().map((i) => i.json);\nconst merged = $('Merge LLM Results').all().map((i) => i.json);\nconst out = $input.all().map((i) => i.json);\n\nconst ranked = out.filter((o) => o.tab === 'Ranked').map((o) => o.row);\nconst review = out.filter((o) => o.tab === 'Needs Review').map((o) => o.row);\nconst problems = [];\n\n// 1. Every CSV row is either closed or open\nconst rowsRead = csvRows.length;\nconst closedSkipped = csvRows.filter((r) => config.closedStatuses.includes(norm(r['Status']))).length;\nif (rowsRead === 0) problems.push('CSV has no rows');\nif (closedSkipped + openJobs.length !== rowsRead) {\n  problems.push(`Rows Read ${rowsRead} ≠ Closed ${closedSkipped} + Open ${openJobs.length}`);\n}\n\n// 2. Every open job lands in exactly one tab\nif (out.some((o) => o.tab !== 'Ranked' && o.tab !== 'Needs Review')) problems.push('An output item has no valid tab');\nif (ranked.length + review.length !== openJobs.length) {\n  problems.push(`Ranked ${ranked.length} + Needs Review ${review.length} ≠ Open ${openJobs.length}`);\n}\n\n// 3. Same Job Numbers in as out (catches a job dropped and another duplicated, which plain totals would miss)\nconst tally = (list) => list.reduce((m, j) => m.set(j, (m.get(j) ?? 0) + 1), new Map());\nconst before = tally(openJobs.map((j) => j.jobNumber));\nconst after = tally([...ranked, ...review].map((r) => r['Job Number']));\nfor (const [job, n] of before) if (after.get(job) !== n) problems.push(`Job \"${job}\" appears ${after.get(job) ?? 0} time(s) in output, expected ${n}`);\nfor (const [job] of after) if (!before.has(job)) problems.push(`Job \"${job}\" is in the output but not in the open jobs`);\n\n// 4. Ranks are 1..N with no gaps\nconst gap = ranked.findIndex((r, i) => r['Rank'] !== i + 1);\nif (gap !== -1) problems.push(`Ranks are not 1..${ranked.length}: position ${gap + 1} has Rank ${ranked[gap]['Rank']}`);\n\n// 5. Required cells are filled, and no broken values leaked into any cell\nfor (const r of ranked) if (!r['Reason'] || !r['Allowed Dates']) problems.push(`Ranked job ${r['Job Number']} is missing Reason or Allowed Dates`);\nfor (const r of review) {\n  if (!['Needs human decision', 'Not this fortnight'].includes(r['Issue Category']) || !r['Issue']) {\n    problems.push(`Needs Review job ${r['Job Number']} is missing a valid Issue Category or Issue`);\n  }\n}\nconst broken = /\\bundefined\\b|\\bNaN\\b|Invalid DateTime|\\[object Object\\]/;\nfor (const r of [...ranked, ...review]) {\n  for (const [col, val] of Object.entries(r)) {\n    if (broken.test(String(val))) problems.push(`Job ${r['Job Number']}, column \"${col}\" contains \"${String(val).match(broken)[0]}\"`);\n  }\n}\n// 6. If too many AI calls failed, the AI itself is broken (outage, no balance, bad key, or a broken prompt).\n//    Stop instead of sending every job to review and overwriting the good list.\nconst llmCalls = merged.filter((j) => j.needsLlm).length;\nconst llmNoResponse = merged.filter((j) => j.llmStatus === 'failed').length;\nconst llmBadOutput = merged.filter((j) => j.llmStatus === 'invalid').length;\nconst llmFailures = llmNoResponse + llmBadOutput;\nconst MAX_FAIL_SHARE = 0.2;\nconst MIN_FAILS_TO_STOP = 3;\nif (llmFailures >= MIN_FAILS_TO_STOP && llmFailures / llmCalls > MAX_FAIL_SHARE) {\n  problems.push(\n    `${llmFailures} of ${llmCalls} AI calls failed (${llmNoResponse} no response, ${llmBadOutput} bad output). ` +\n    (llmNoResponse >= llmBadOutput\n      ? 'The AI service may be down, out of balance, or the key is wrong.'\n      : 'Claude is answering but its output keeps failing checks: check the prompt or model.') +\n    ' Old lists kept.'\n  );\n}\n\nif (problems.length) {\n  throw new Error(`Counts check failed, nothing was written:\\n- ${problems.slice(0, 20).join('\\n- ')}`);\n}\n\nconst runId = (ranked[0] ?? review[0])?.['Run ID'] ?? `${$now.toFormat('yyyy-MM-dd HH:mm')} #${$execution.id}`;\n\nreturn [{ json: {\n  summary: {\n    runId, rowsRead, closedSkipped, openJobs: openJobs.length,\n    ranked: ranked.length, needsReview: review.length, llmCalls, llmFailures,\n  },\n  ranked,\n  review,\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2416,
+        -80
+      ],
+      "id": "d39595ff-4268-4480-82b9-a8b93de4101b",
+      "name": "Counts Check"
+    },
+    {
+      "parameters": {
+        "operation": "clear",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Ranked",
+          "mode": "name"
+        },
+        "keepFirstRow": true
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2640,
+        -80
+      ],
+      "id": "228cbf10-7b8d-45e7-9413-c6346550a281",
+      "name": "Clear Ranked",
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "clear",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Needs Review",
+          "mode": "name"
+        },
+        "keepFirstRow": true
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2848,
+        -80
+      ],
+      "id": "3fcbbdf3-a9e2-471a-822c-8ac8636c2b0a",
+      "name": "Clear Needs Review",
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Ranked Rows: one item per Ranked sheet row\nconst { ranked, summary } = $('Counts Check').first().json;\nif (ranked.length === 0) return [{ json: { 'Reason': `No jobs ranked in run ${summary.runId}`, 'Run ID': summary.runId } }];\nreturn ranked.map((row) => ({ json: row }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3072,
+        -80
+      ],
+      "id": "32742baf-55bf-4bea-9996-6966d49b3723",
+      "name": "Ranked Rows"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Ranked",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Rank",
+              "displayName": "Rank",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Job Number",
+              "displayName": "Job Number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Organization",
+              "displayName": "Organization",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "State",
+              "displayName": "State",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Sector",
+              "displayName": "Sector",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Created Date",
+              "displayName": "Created Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Rank Step",
+              "displayName": "Rank Step",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Allowed Dates",
+              "displayName": "Allowed Dates",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Booking Notes",
+              "displayName": "Booking Notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Reason",
+              "displayName": "Reason",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Run ID",
+              "displayName": "Run ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        3296,
+        -80
+      ],
+      "id": "395a37ef-6902-49d7-87e1-bc49caba2976",
+      "name": "Append Ranked",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Review Rows: one item per Needs Review sheet row\nconst { review, summary } = $('Counts Check').first().json;\nif (review.length === 0) return [{ json: { 'Issue': `No jobs need review in run ${summary.runId}`, 'Run ID': summary.runId } }];\nreturn review.map((row) => ({ json: row }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3520,
+        -80
+      ],
+      "id": "d6db0996-fa23-47ef-9fac-3a19dd39ed00",
+      "name": "Review Rows"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Needs Review",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Job Number",
+              "displayName": "Job Number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Organization",
+              "displayName": "Organization",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "State",
+              "displayName": "State",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Sector",
+              "displayName": "Sector",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Status",
+              "displayName": "Status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Created Date",
+              "displayName": "Created Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Issue Category",
+              "displayName": "Issue Category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Issue",
+              "displayName": "Issue",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Source Text",
+              "displayName": "Source Text",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Run ID",
+              "displayName": "Run ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        3744,
+        -80
+      ],
+      "id": "7dea10fc-84a5-44b6-b0d5-77e23f565c2f",
+      "name": "Append Needs Review",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Run Log Row: builds the success row. Runs only after both tabs were written.\nconst s = $('Counts Check').first().json.summary;\n\nreturn [{ json: {\n  'Run ID': s.runId,\n  'Started': $('Validate Rules').first().json.startedAt ?? '',\n  'Finished': $now.toFormat('dd/MM/yyyy HH:mm:ss'),\n  'Result': 'Success',\n  'Rows Read': s.rowsRead,\n  'Closed Skipped': s.closedSkipped,\n  'Open Jobs': s.openJobs,\n  'Ranked': s.ranked,\n  'Needs Review': s.needsReview,\n  'LLM Calls': s.llmCalls,\n  'LLM Failures': s.llmFailures,\n  'Error': '',\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3968,
+        -80
+      ],
+      "id": "3cc3ecd8-c2e7-49d2-9b0c-4a17350accba",
+      "name": "Run Log Row"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Run Log",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Run ID",
+              "displayName": "Run ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Started",
+              "displayName": "Started",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Finished",
+              "displayName": "Finished",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Result",
+              "displayName": "Result",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Rows Read",
+              "displayName": "Rows Read",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Closed Skipped",
+              "displayName": "Closed Skipped",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Open Jobs",
+              "displayName": "Open Jobs",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Ranked",
+              "displayName": "Ranked",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Needs Review",
+              "displayName": "Needs Review",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "LLM Calls",
+              "displayName": "LLM Calls",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "LLM Failures",
+              "displayName": "LLM Failures",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Error",
+              "displayName": "Error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        4192,
+        -80
+      ],
+      "id": "a17618d9-8d7e-4333-8321-975cb8df3f28",
+      "name": "Append Run Log",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeksInterval": 2,
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 7
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ],
+      "id": "3c659aef-b352-464f-ae5c-242fef4f014e",
+      "name": "Schedule Trigger"
+    }
+  ],
+  "connections": {
+    "Get and Reads backlog.csv": {
+      "main": [
+        [
+          {
+            "node": "Checks backlog.csv",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Checks backlog.csv": {
+      "main": [
+        [
+          {
+            "node": "Filter and Flag Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Rules Tab": {
+      "main": [
+        [
+          {
+            "node": "Validate Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter and Flag Rows": {
+      "main": [
+        [
+          {
+            "node": "Needs AI?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Rules": {
+      "main": [
+        [
+          {
+            "node": "Get and Reads backlog.csv",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs AI?": {
+      "main": [
+        [
+          {
+            "node": "AI: Read Notes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anthropic Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI: Read Notes",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structured Output Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "AI: Read Notes",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Read Notes": {
+      "main": [
+        [
+          {
+            "node": "Merge LLM Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge LLM Results": {
+      "main": [
+        [
+          {
+            "node": "Categorize and Rank",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Categorize and Rank": {
+      "main": [
+        [
+          {
+            "node": "Counts Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Counts Check": {
+      "main": [
+        [
+          {
+            "node": "Clear Ranked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Ranked": {
+      "main": [
+        [
+          {
+            "node": "Clear Needs Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Needs Review": {
+      "main": [
+        [
+          {
+            "node": "Ranked Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ranked Rows": {
+      "main": [
+        [
+          {
+            "node": "Append Ranked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append Ranked": {
+      "main": [
+        [
+          {
+            "node": "Review Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review Rows": {
+      "main": [
+        [
+          {
+            "node": "Append Needs Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append Needs Review": {
+      "main": [
+        [
+          {
+            "node": "Run Log Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Log Row": {
+      "main": [
+        [
+          {
+            "node": "Append Run Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Rules Tab",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "active": false
+}

@@ -1,0 +1,248 @@
+{
+  "name": "Backlog Ranking: Error Alert",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "3326336f-82a1-43fc-9f53-3c09508cdd5c",
+      "name": "Error Trigger"
+    },
+    {
+      "parameters": {
+        "sendTo": "you@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        448,
+        0
+      ],
+      "id": "f908e052-d691-4d59-9e03-44de734bdbf4",
+      "name": "Send an alert message",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "Gmail account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Run Log",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Run ID": "={{ $('Build Alert').first().json.runLog['Run ID'] }}",
+            "Finished": "={{ $('Build Alert').first().json.runLog.Finished }}",
+            "Result": "Failed",
+            "Error": "={{ $('Build Alert').first().json.runLog.Error }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Run ID",
+              "displayName": "Run ID",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Started",
+              "displayName": "Started",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Finished",
+              "displayName": "Finished",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Result",
+              "displayName": "Result",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Rows Read",
+              "displayName": "Rows Read",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Closed Skipped",
+              "displayName": "Closed Skipped",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Open Jobs",
+              "displayName": "Open Jobs",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Ranked",
+              "displayName": "Ranked",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Needs Review",
+              "displayName": "Needs Review",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "LLM Calls",
+              "displayName": "LLM Calls",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "LLM Failures",
+              "displayName": "LLM Failures",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Error",
+              "displayName": "Error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        672,
+        0
+      ],
+      "id": "a3197fbc-3acb-4292-b91c-f23a6e94cd17",
+      "name": "Log Failure",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Alert: turns n8n's error details into a plain-English email and a Run Log row\nconst ADMIN = 'the automation admin'; // who to contact when the reader can't fix it themselves\n\n// Must match the node names in the main workflow exactly\nconst WRITE_NODES = ['Clear Ranked', 'Clear Needs Review', 'Ranked Rows', 'Append Ranked', 'Review Rows', 'Append Needs Review'];\nconst LOG_NODES = ['Run Log Row', 'Append Run Log'];\n\nconst e = $input.first().json;\nconst now = $now.toFormat('dd/MM/yyyy HH:mm:ss');\nconst runId = `${$now.toFormat('yyyy-MM-dd HH:mm')} #${e.execution?.id ?? ''}`; // same format as successful runs\nconst message = e.execution?.error?.message ?? e.trigger?.error?.message ?? 'Unknown error';\nconst failedNode = e.execution?.lastNodeExecuted ?? 'unknown step';\nconst m = message.toLowerCase();\n\n// Is the list in the Sheet still safe to use? Depends on WHERE it failed.\nlet safe;\nif (WRITE_NODES.includes(failedNode)) {\n  safe = `NO. The run stopped while writing the new list, so the Ranked and/or Needs Review tabs may be empty or only half-filled. ` +\n    `Do not use them until this is fixed. To see the last good list, open the Sheet and go to File > Version history, ` +\n    `and look at the version from before ${now}.`;\n} else if (LOG_NODES.includes(failedNode)) {\n  safe = 'Yes. The Ranked and Needs Review tabs WERE updated in this run. Only the Run Log entry could not be written.';\n} else {\n  safe = 'Yes. The Ranked and Needs Review tabs still show the list from the last successful run. ' +\n    'They were NOT updated. Check the Run Log tab for when that was.';\n}\n\n// Plain-English \"what to do\", based on what failed\nlet whatToDo;\nif (failedNode === 'Validate Rules') {\n  whatToDo = 'Someone edited the Rules tab and a row has a mistake (the details below say which row). Open the Rules tab, fix that row (check spelling and dates). It will work on the next run. Use File > Version history if you are unsure what changed.';\n} else if (m.includes('csv is missing columns') || m.includes('csv has no rows')) {\n  whatToDo = 'The backlog export is empty or looks different from usual (a column is missing or was renamed). Re-export the backlog with the standard columns, or ask the person who changed the export.';\n} else if (m.includes('ai calls failed') && m.includes('check the prompt or model')) {\n  whatToDo = `The AI service is answering, but its answers keep failing our checks. This needs a fix to the setup. Please forward this email to ${ADMIN}.`;\n} else if (m.includes('ai calls failed')) {\n  whatToDo = `The AI service is not answering. It may be down, or the API balance may have run out. Check the balance at console.anthropic.com. If the balance is fine, the next scheduled run will try again. If it fails again, forward this email to ${ADMIN}.`;\n} else if (failedNode === 'Counts Check') {\n  whatToDo = `A safety check found jobs that would have been lost or doubled, so nothing was written. Please forward this email to ${ADMIN}.`;\n} else if (/quota|rate limit|too many requests|\\b429\\b/.test(m)) {\n  whatToDo = `Google or the AI service asked us to slow down (too many requests). This usually clears by itself, and the next scheduled run should work. If it keeps happening, forward this email to ${ADMIN}.`;\n} else if (/\\b(401|403)\\b|unauthori[sz]ed|forbidden|invalid_grant|invalid (x-)?api[ -]?key|credentials? (are |is )?(invalid|expired)|token (has )?expired|reconnect/.test(m)) {\n  whatToDo = `A login to Google or the AI service has expired. ${ADMIN} needs to reconnect it in n8n (it takes about a minute).`;\n} else {\n  whatToDo = `Something unexpected went wrong. Please forward this email to ${ADMIN}.`;\n}\n\nreturn [{ json: {\n  subject: `❌ Backlog ranking did not update (${failedNode})`,\n  body:\n    `WHAT HAPPENED\\nThe backlog ranking did not run successfully on ${now}.\\n\\n` +\n    `IS THE LIST STILL SAFE TO USE?\\n${safe}\\n\\n` +\n    `WHAT TO DO\\n${whatToDo}\\n\\n` +\n    `DETAILS (for ${ADMIN})\\nStep: ${failedNode}\\nError: ${message}\\nExecution: ${e.execution?.url ?? e.execution?.id ?? ''}`,\n  runLog: {\n    'Run ID': runId,\n    'Started': '',\n    'Finished': now,\n    'Result': 'Failed',\n    'Error': `${failedNode}: ${message}`,\n  },\n} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ],
+      "id": "f764b131-17e4-4821-aca4-59db518ef678",
+      "name": "Build Alert"
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an alert message": {
+      "main": [
+        [
+          {
+            "node": "Log Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Alert": {
+      "main": [
+        [
+          {
+            "node": "Send an alert message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "active": false
+}

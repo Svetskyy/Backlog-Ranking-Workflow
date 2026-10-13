@@ -1,0 +1,9 @@
+# Secrets
+client_secret*.json
+.env
+.env.*
+
+# Never commit real data: only sample/backlog.csv belongs in this repo
+/backlog.csv
+*.pdf
+*.docx
